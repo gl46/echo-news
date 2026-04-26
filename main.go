@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"encoding/xml"
@@ -8,9 +9,11 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
+	"github.com/joho/godotenv"
 	_ "modernc.org/sqlite"
 )
 
@@ -35,7 +38,20 @@ CREATE TABLE IF NOT EXISTS articles (
 	created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
 	updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+
+CREATE TABLE IF NOT EXISTS translations (
+	id INTEGER PRIMARY KEY AUTOINCREMENT,
+	article_id INTEGER NOT NULL UNIQUE,
+	target_lang TEXT NOT NULL DEFAULT 'zh-CN',
+	translation TEXT NOT NULL,
+	model TEXT,
+	created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+	updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+	FOREIGN KEY(article_id) REFERENCES articles(id)
+);
 `
+
+const defaultTargetLang = "zh-CN"
 
 type RSS struct {
 	XMLName xml.Name `xml:"rss"`
@@ -77,8 +93,20 @@ type ArticleResponse struct {
 	HasTranslation bool   `json:"has_translation"`
 }
 
+type TranslateResponse struct {
+	ID          string `json:"id"`
+	Translation string `json:"translation"`
+}
+
+type articleForTranslation struct {
+	ID      int64
+	Title   string
+	Summary string
+}
+
 type App struct {
-	db *sql.DB
+	db         *sql.DB
+	translator *Translator
 }
 
 func fetchRSS(url string) (string, error) {
@@ -183,12 +211,22 @@ func syncArticles(db *sql.DB) error {
 
 func listArticles(db *sql.DB) ([]ArticleResponse, error) {
 	const query = `
-	SELECT guid, title, description, link, published_at, source
-	FROM articles
-	ORDER BY published_at DESC, id DESC;
+	SELECT
+		a.id,
+		a.title,
+		a.description,
+		a.link,
+		a.published_at,
+		a.source,
+		EXISTS (
+			SELECT 1 FROM translations t
+			WHERE t.article_id = a.id AND t.target_lang = ?
+		)
+	FROM articles a
+	ORDER BY a.published_at DESC, a.id DESC;
 	`
 
-	rows, err := db.Query(query)
+	rows, err := db.Query(query, defaultTargetLang)
 	if err != nil {
 		return nil, err
 	}
@@ -197,18 +235,24 @@ func listArticles(db *sql.DB) ([]ArticleResponse, error) {
 	articles := make([]ArticleResponse, 0)
 	for rows.Next() {
 		var article ArticleResponse
+		var articleID int64
+		var summary sql.NullString
+		var hasTranslation int
 		if err := rows.Scan(
-			&article.ID,
+			&articleID,
 			&article.Title,
-			&article.Summary,
+			&summary,
 			&article.URL,
 			&article.PublishedAt,
 			&article.Source,
+			&hasTranslation,
 		); err != nil {
 			return nil, err
 		}
 
-		article.HasTranslation = false
+		article.ID = strconv.FormatInt(articleID, 10)
+		article.Summary = strings.TrimSpace(summary.String)
+		article.HasTranslation = hasTranslation != 0
 		if article.Summary == "" {
 			article.Summary = article.Title
 		}
@@ -231,6 +275,121 @@ func (a *App) articleHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, articles)
+}
+
+func (a *App) translateHandler(w http.ResponseWriter, r *http.Request) {
+	articleID, err := parseArticleID(r.PathValue("id"))
+	if err != nil {
+		http.Error(w, "invalid article id", http.StatusBadRequest)
+		return
+	}
+
+	cached, ok, err := cachedTranslation(a.db, articleID)
+	if err != nil {
+		http.Error(w, "failed to load translation", http.StatusInternalServerError)
+		return
+	}
+	if ok {
+		writeJSON(w, http.StatusOK, TranslateResponse{
+			ID:          strconv.FormatInt(articleID, 10),
+			Translation: cached,
+		})
+		return
+	}
+
+	article, err := loadArticleForTranslation(a.db, articleID)
+	if err == sql.ErrNoRows {
+		http.Error(w, "article not found", http.StatusNotFound)
+		return
+	}
+	if err != nil {
+		http.Error(w, "failed to load article", http.StatusInternalServerError)
+		return
+	}
+
+	if a.translator == nil {
+		http.Error(w, "translation service is not configured", http.StatusServiceUnavailable)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
+	defer cancel()
+
+	translation, err := a.translator.TranslateArticle(ctx, article.Title, article.Summary)
+	if err != nil {
+		http.Error(w, "translation failed", http.StatusBadGateway)
+		return
+	}
+
+	if err := saveTranslation(a.db, article.ID, defaultTargetLang, translation, a.translator.Model()); err != nil {
+		http.Error(w, "failed to save translation", http.StatusInternalServerError)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, TranslateResponse{
+		ID:          strconv.FormatInt(articleID, 10),
+		Translation: translation,
+	})
+}
+
+func parseArticleID(value string) (int64, error) {
+	id, err := strconv.ParseInt(strings.TrimSpace(value), 10, 64)
+	if err != nil || id <= 0 {
+		return 0, fmt.Errorf("invalid article id %q", value)
+	}
+
+	return id, nil
+}
+
+func cachedTranslation(db *sql.DB, articleID int64) (string, bool, error) {
+	var translation string
+	err := db.QueryRow(
+		`SELECT translation FROM translations WHERE article_id = ? AND target_lang = ?`,
+		articleID,
+		defaultTargetLang,
+	).Scan(&translation)
+	if err == sql.ErrNoRows {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, err
+	}
+
+	return translation, true, nil
+}
+
+func loadArticleForTranslation(db *sql.DB, articleID int64) (articleForTranslation, error) {
+	var article articleForTranslation
+	var summary sql.NullString
+	err := db.QueryRow(
+		`SELECT id, title, description FROM articles WHERE id = ?`,
+		articleID,
+	).Scan(&article.ID, &article.Title, &summary)
+	if err != nil {
+		return articleForTranslation{}, err
+	}
+
+	article.Summary = strings.TrimSpace(summary.String)
+	if article.Summary == "" {
+		article.Summary = article.Title
+	}
+
+	return article, nil
+}
+
+func saveTranslation(db *sql.DB, articleID int64, targetLang, translation, model string) error {
+	const query = `
+	INSERT INTO translations (article_id, target_lang, translation, model)
+	VALUES (?, ?, ?, ?)
+	ON CONFLICT(article_id) DO UPDATE SET
+		target_lang = excluded.target_lang,
+		translation = excluded.translation,
+		model = excluded.model,
+		updated_at = CURRENT_TIMESTAMP;
+	`
+
+	_, err := db.Exec(query, articleID, targetLang, translation, model)
+	return err
 }
 
 func writeJSON(w http.ResponseWriter, statusCode int, data any) {
@@ -280,6 +439,8 @@ func normalizePublishedAt(value string) string {
 }
 
 func main() {
+	loadEnvFile()
+
 	dbPath := defaultDBPath
 	if envPath := strings.TrimSpace(os.Getenv("DATABASE_URL")); envPath != "" {
 		dbPath = envPath
@@ -288,6 +449,11 @@ func main() {
 	port := defaultPort
 	if envPort := strings.TrimSpace(os.Getenv("PORT")); envPort != "" {
 		port = envPort
+	}
+
+	staticDir := strings.TrimSpace(os.Getenv("STATIC_DIR"))
+	if staticDir == "" {
+		staticDir = "./echo-news-fronted/dist"
 	}
 
 	db, err := openDB(dbPath)
@@ -306,14 +472,38 @@ func main() {
 		fmt.Println("warning: failed to sync RSS feed:", err)
 	}
 
-	app := &App{db: db}
+	app := &App{
+		db:         db,
+		translator: NewTranslatorFromEnv(),
+	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/articles", app.articleHandler)
+	mux.HandleFunc("POST /api/translate/{id}", app.translateHandler)
+
+	// Serve frontend static files if the directory exists
+	if info, err := os.Stat(staticDir); err == nil && info.IsDir() {
+		fs := http.FileServer(http.Dir(staticDir))
+		mux.HandleFunc("GET /", func(w http.ResponseWriter, r *http.Request) {
+			// Try serving the file directly first
+			path := staticDir + r.URL.Path
+			if _, err := os.Stat(path); err == nil {
+				fs.ServeHTTP(w, r)
+				return
+			}
+			// Fall back to index.html for SPA routing
+			http.ServeFile(w, r, staticDir+"/index.html")
+		})
+		fmt.Printf("serving static files from %s\n", staticDir)
+	}
 
 	fmt.Printf("server listening on :%s\n", port)
 	if err := http.ListenAndServe(":"+port, mux); err != nil {
 		fmt.Println("server error:", err)
 		os.Exit(1)
 	}
+}
+
+func loadEnvFile() {
+	_ = godotenv.Load()
 }

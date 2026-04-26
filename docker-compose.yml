@@ -1,0 +1,18 @@
+services:
+  echo-news:
+    build: .
+    container_name: echo-news
+    env_file:
+      - .env
+    ports:
+      - "8080:8080"
+    volumes:
+      - echo-news-data:/app/data
+    environment:
+      - PORT=8080
+      - DATABASE_URL=/app/data/echo-news.db
+      - STATIC_DIR=/app/static
+    restart: unless-stopped
+
+volumes:
+  echo-news-data:

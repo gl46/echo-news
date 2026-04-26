@@ -1,0 +1,8 @@
+echo-news
+echo-news.db
+echo-news-fronted/node_modules
+echo-news-fronted/dist
+.git
+.github
+*.md
+.claude

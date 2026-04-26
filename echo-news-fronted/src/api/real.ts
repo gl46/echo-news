@@ -1,16 +1,15 @@
 import type { ArticleDetail, ArticleSummary, TranslateResult } from './types'
-import {
-  fetchArticle as fetchMockArticle,
-  translateArticle as translateMockArticle,
-} from './mock'
+import { fetchArticle as fetchMockArticle } from './mock'
 
 const articleCache = new Map<string, ArticleSummary>()
 const translationCache = new Map<string, string>()
 
-async function requestJSON<T>(path: string): Promise<T> {
+async function requestJSON<T>(path: string, options: RequestInit = {}): Promise<T> {
   const response = await fetch(path, {
+    ...options,
     headers: {
       Accept: 'application/json',
+      ...options.headers,
     },
   })
 
@@ -28,14 +27,10 @@ function cacheArticles(items: ArticleSummary[]) {
 }
 
 function buildFallbackDetail(article: ArticleSummary): ArticleDetail {
-  const content = article.summary
-    ? `${article.summary}\n\nFull article content is not available in the backend yet. Open the original BBC link to read the complete story.`
-    : 'Full article content is not available in the backend yet. Open the original BBC link to read the complete story.'
-
   return {
     id: article.id,
     title: article.title,
-    content,
+    content: article.summary || article.title,
     url: article.url,
     published_at: article.published_at,
     source: article.source,
@@ -74,22 +69,10 @@ export async function translateArticle(id: string): Promise<TranslateResult> {
     return { id, translation: cachedTranslation }
   }
 
-  try {
-    const result = await translateMockArticle(id)
-    translationCache.set(id, result.translation)
-    return result
-  } catch {
-    const article = articleCache.get(id)
-    if (!article) {
-      throw new Error('Translation API is not ready yet')
-    }
+  const result = await requestJSON<TranslateResult>(`/api/translate/${encodeURIComponent(id)}`, {
+    method: 'POST',
+  })
 
-    const placeholderTranslation =
-      `翻译接口还没接上，这里先展示一份前端占位内容。\n\n` +
-      `标题：${article.title}\n\n` +
-      `摘要：${article.summary}`
-
-    translationCache.set(id, placeholderTranslation)
-    return { id, translation: placeholderTranslation }
-  }
+  translationCache.set(id, result.translation)
+  return result
 }

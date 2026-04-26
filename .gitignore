@@ -1,0 +1,10 @@
+.DS_Store
+
+# Local runtime files
+.env
+.env.*
+echo-news
+echo-news.db
+
+# Personal notes / weekly writeups
+week*.md
